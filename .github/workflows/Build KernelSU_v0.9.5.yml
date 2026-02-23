@@ -170,6 +170,24 @@ jobs:
             "$RUNC_PATCH_SCRIPT" "kernel/cgroup/cgroup.c"
           fi
 
+          validate_runc_patch() {
+            local target="$1"
+            if [ ! -f "$target" ]; then
+              return 0
+            fi
+            if grep -qE "^static int cgroup_add_file\(" "$target"; then
+              if grep -qE "kernfs_create_link\(cgrp->kn, name, kn\);" "$target"; then
+                echo "✅ runc patch verified: $target"
+              else
+                echo "❌ runc patch missing in $target"
+                return 1
+              fi
+            fi
+          }
+
+          validate_runc_patch "kernel/cgroup.c"
+          validate_runc_patch "kernel/cgroup/cgroup.c"
+
       - name: "😋 Update KernelSU"
         working-directory: ${{ env.KERNEL_NAME }}
         env:
@@ -209,11 +227,28 @@ jobs:
             fi
           fi
 
-          echo -e "CONFIG_KPROBES=y" >> arch/${{ env.arch }}/configs/${{ env.DEFCONFIG_NAME }}
-          echo -e "CONFIG_HAVE_KPROBES=y" >> arch/${{ env.arch }}/configs/${{ env.DEFCONFIG_NAME }}
-          echo -e "CONFIG_KPROBE_EVENTS=y" >> arch/${{ env.arch }}/configs/${{ env.DEFCONFIG_NAME }}
+          DEFCONFIG_PATH="arch/${{ env.arch }}/configs/${{ env.DEFCONFIG_NAME }}"
+          if [ -s "$DEFCONFIG_PATH" ] && [ "$(tail -c1 "$DEFCONFIG_PATH" | wc -l)" -eq 0 ]; then
+            echo >> "$DEFCONFIG_PATH"
+          fi
 
-          cat arch/${{ env.arch }}/configs/${{ env.DEFCONFIG_NAME }}
+          set_cfg() {
+            local key="$1"
+            local value="$2"
+
+            sed -i -E "/^${key}=|^# ${key} is not set$/d" "$DEFCONFIG_PATH"
+            if [ "$value" = "n" ]; then
+              echo "# ${key} is not set" >> "$DEFCONFIG_PATH"
+            else
+              echo "${key}=${value}" >> "$DEFCONFIG_PATH"
+            fi
+          }
+
+          set_cfg "CONFIG_KPROBES" "y"
+          set_cfg "CONFIG_HAVE_KPROBES" "y"
+          set_cfg "CONFIG_KPROBE_EVENTS" "y"
+
+          cat "$DEFCONFIG_PATH"
 
       - name: "👍 Make defconfig"
         working-directory: ${{ env.KERNEL_NAME }}
@@ -223,6 +258,57 @@ jobs:
         run: |
           echo "PATH Variable: $PATH"
           make ${{ env.args }} ${{ env.DEFCONFIG_NAME }}
+
+      - name: "🔎 Validate LXC-Docker config"
+        if: ${{ env.withLxcDocker == 'true' }}
+        working-directory: ${{ env.KERNEL_NAME }}
+        run: |
+          CONFIG_PATH="${{ env.OUT_DIR }}/.config"
+          if [ ! -f "$CONFIG_PATH" ]; then
+            echo "❌ Missing generated config: $CONFIG_PATH"
+            exit 1
+          fi
+
+          require_cfg_y() {
+            local key="$1"
+            if grep -qE "^${key}=y$" "$CONFIG_PATH"; then
+              echo "✅ ${key}=y"
+            else
+              echo "❌ Missing ${key}=y"
+              exit 1
+            fi
+          }
+
+          require_cfg_n() {
+            local key="$1"
+            if grep -qE "^# ${key} is not set$" "$CONFIG_PATH"; then
+              echo "✅ ${key}=n"
+            else
+              echo "❌ Expected ${key}=n"
+              exit 1
+            fi
+          }
+
+          for key in \
+            CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_IPC_NS CONFIG_UTS_NS \
+            CONFIG_CGROUPS CONFIG_CGROUP_CPUACCT CONFIG_CGROUP_DEVICE CONFIG_CGROUP_FREEZER CONFIG_CGROUP_SCHED CONFIG_CPUSETS CONFIG_MEMCG \
+            CONFIG_KEYS CONFIG_POSIX_MQUEUE \
+            CONFIG_VETH CONFIG_BRIDGE CONFIG_BRIDGE_NETFILTER \
+            CONFIG_IP_NF_FILTER CONFIG_IP_NF_MANGLE CONFIG_IP_NF_RAW CONFIG_IP_NF_NAT CONFIG_IP_NF_TARGET_MASQUERADE \
+            CONFIG_IP6_NF_FILTER CONFIG_IP6_NF_MANGLE CONFIG_IP6_NF_RAW CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE \
+            CONFIG_NF_NAT CONFIG_NETFILTER_XT_MATCH_ADDRTYPE CONFIG_NETFILTER_XT_MATCH_CONNTRACK CONFIG_NETFILTER_XT_MATCH_IPVS CONFIG_NETFILTER_XT_MARK \
+            CONFIG_OVERLAY_FS CONFIG_EXT4_FS CONFIG_EXT4_FS_POSIX_ACL CONFIG_EXT4_FS_SECURITY \
+            CONFIG_SECCOMP CONFIG_SECCOMP_FILTER CONFIG_CGROUP_BPF CONFIG_MULTIUSER; do
+            require_cfg_y "$key"
+          done
+
+          if grep -RqsE "^[[:space:]]*config[[:space:]]+NF_NAT_NEEDED([[:space:]]|$)" --include='Kconfig*' .; then
+            require_cfg_y "CONFIG_NF_NAT_NEEDED"
+          else
+            echo "ℹ️ Skip CONFIG_NF_NAT_NEEDED check: symbol not present in this kernel"
+          fi
+
+          require_cfg_n "CONFIG_ANDROID_PARANOID_NETWORK"
 
       - name: "🎶 Build kernel"
         working-directory: ${{ env.KERNEL_NAME }}
